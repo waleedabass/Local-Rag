@@ -1,6 +1,6 @@
 # Local PDF RAG Assistant — Setup Guide
 
-This project runs a **local** meeting assistant: PDFs in `source_docs` are embedded with **sentence-transformers/all-MiniLM-L6-v2**, stored in **ChromaDB** (`./db`), and answers are generated with **Ollama** using **llama3.2:3b**. A **FastAPI** server exposes `/chat` and serves a small HTML UI at `/`.
+This project runs a **local** meeting assistant: PDFs in `source_docs` are embedded with **sentence-transformers/all-MiniLM-L6-v2**, stored in **ChromaDB** (`./db`), and answers are generated with **Ollama** using **llama3.2:3b**. A **FastAPI** server exposes `/chat`, **`/transcribe`** (local **Whisper** via faster-whisper), and serves a small HTML UI at `/`.
 
 ---
 
@@ -13,6 +13,7 @@ This project runs a **local** meeting assistant: PDFs in `source_docs` are embed
 | **Ollama** | [https://ollama.com](https://ollama.com) — must be installed and running locally. |
 | **NVIDIA GPU (optional)** | RTX 2060 6GB works; embeddings and the LLM benefit from GPU. CPU works but is slower. |
 | **~32GB RAM** | Comfortable for MiniLM + 3B model; less RAM may still work with smaller batches. |
+| **FFmpeg** | Required on **PATH** for Whisper to decode browser recordings (WebM, etc.). Install from [ffmpeg.org](https://ffmpeg.org/download.html) or `winget install FFmpeg`. |
 
 ---
 
@@ -109,7 +110,8 @@ python -m uvicorn app:app --host 127.0.0.1 --port 8000
 2. **Live Mode** toggle:
    - **On** (`is_active: true`): runs embedding search + Ollama (normal Q&A).
    - **Off**: returns an **empty** response immediately to save GPU/CPU when you are not actively asking questions.
-3. Paste or type meeting transcription / questions in the text area and submit.
+3. Enter text in the box (type, paste) or use **Record (Whisper)**: the browser records audio, uploads it to **`/transcribe`**, and the server runs **local Whisper** (first use downloads the model). Allow the microphone when prompted.
+4. Click **Ask** to run RAG on the current text.
 
 Interactive API docs: **http://127.0.0.1:8000/docs**
 
@@ -131,6 +133,8 @@ JSON body:
 - If `is_active` is `false`, the server skips retrieval and the LLM and returns an empty `response` (and no chunk usage).
 - If nothing relevant is in the index, the model is instructed to answer with *Information not found in documents.*
 
+**POST** `/transcribe` — multipart form field **`file`** (audio: WebM, WAV, MP3, etc.). Returns JSON `{"text": "..."}`. Requires FFmpeg on PATH.
+
 ---
 
 ## 8. Environment variables
@@ -139,6 +143,10 @@ JSON body:
 |----------|---------|---------|
 | `OLLAMA_HOST` | `http://127.0.0.1:11434` | Ollama API base URL |
 | `OLLAMA_MODEL` | `llama3.2:3b` | Model name for `/api/chat` |
+| `WHISPER_MODEL` | `base` | Whisper model size: `tiny`, `base`, `small`, … (VRAM vs quality tradeoff) |
+| `WHISPER_DEVICE` | *(auto)* | `cuda` or `cpu` (defaults to CUDA if PyTorch sees a GPU) |
+| `WHISPER_COMPUTE_TYPE` | *(auto)* | e.g. `float16` (GPU) or `int8` (CPU); override if load fails |
+| `WHISPER_LANG` | *(auto)* | Optional ISO code (e.g. `en`) to skip language detection |
 
 **PowerShell example** (same session as uvicorn):
 
@@ -186,6 +194,8 @@ Current behavior: ingestion **rebuilds** the `meeting_docs` collection so the in
 | **Scanned PDFs, no text** | PyMuPDF extracts text layers only; OCR’d PDFs or images need OCR first. |
 | **Slow responses** | Install CUDA PyTorch; ensure GPU is used (`torch.cuda.is_available()` in Python). LLM latency dominates; smaller prompts and fewer chunks help (this app already uses top-3 chunks). |
 | **Port 8000 in use** | Run uvicorn on another port: `python -m uvicorn app:app --host 127.0.0.1 --port 8001` |
+| **Transcription failed / FFmpeg** | Install FFmpeg and ensure `ffmpeg` works in a terminal; restart the app. |
+| **Whisper out of VRAM** | Set `WHISPER_MODEL=tiny` or `WHISPER_DEVICE=cpu` (slower). |
 
 ---
 
@@ -195,4 +205,4 @@ End-to-end latency is mostly **Ollama generation** (3B on 6GB VRAM) plus network
 
 ---
 
-You are set when: Ollama has `llama3.2:3b`, `pip install` completed, PDFs are in `source_docs`, `ingest.py` succeeds, and **http://127.0.0.1:8000** loads the UI.
+You are set when: Ollama has `llama3.2:3b`, `pip install` completed, FFmpeg is on PATH, PDFs are in `source_docs`, `ingest.py` succeeds, and **http://127.0.0.1:8000** loads the UI.

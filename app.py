@@ -6,7 +6,10 @@ Skips all inference when is_active=False to avoid GPU/CPU work per request.
 
 from __future__ import annotations
 
+import asyncio
 import os
+import tempfile
+import threading
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
@@ -14,7 +17,7 @@ from typing import Any
 import chromadb
 import httpx
 import torch
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
@@ -31,6 +34,11 @@ EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434")
 OLLAMA_CHAT_URL = f"{OLLAMA_HOST.rstrip('/')}/api/chat"
 OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "llama3.2:3b")
+# Whisper (lazy-loaded on first /transcribe). See https://github.com/SYSTRAN/faster-whisper
+WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "base")
+WHISPER_DEVICE = os.environ.get("WHISPER_DEVICE", "")  # empty = auto (cuda if available)
+WHISPER_COMPUTE_TYPE = os.environ.get("WHISPER_COMPUTE_TYPE", "")  # empty = float16 on cuda, int8 on cpu
+WHISPER_LANG = os.environ.get("WHISPER_LANG", "")  # e.g. en; empty = auto-detect
 
 SYSTEM_PROMPT = (
     "You are a professional meeting assistant. Using ONLY the provided context, "
@@ -41,10 +49,53 @@ SYSTEM_PROMPT = (
 # Globals set in lifespan (loaded once for low latency)
 _embed_model: SentenceTransformer | None = None
 _chroma_collection: Any = None
+_whisper_model: Any = None
+_whisper_lock = threading.Lock()
 
 
 def _pick_device() -> str:
     return "cuda" if torch.cuda.is_available() else "cpu"
+
+
+def _whisper_compute_type(device: str) -> str:
+    if WHISPER_COMPUTE_TYPE:
+        return WHISPER_COMPUTE_TYPE
+    return "float16" if device == "cuda" else "int8"
+
+
+def _get_whisper_model() -> Any:
+    """Load faster-whisper once (thread-safe). Kept separate from chat startup cost."""
+    global _whisper_model
+    with _whisper_lock:
+        if _whisper_model is None:
+            from faster_whisper import WhisperModel
+
+            device = WHISPER_DEVICE or _pick_device()
+            compute_type = _whisper_compute_type(device)
+            _whisper_model = WhisperModel(
+                WHISPER_MODEL,
+                device=device,
+                compute_type=compute_type,
+            )
+        return _whisper_model
+
+
+def transcribe_audio_path(path: str) -> str:
+    """Run Whisper on a file path (blocking; call via asyncio.to_thread)."""
+    model = _get_whisper_model()
+    lang = WHISPER_LANG.strip() or None
+    segments, _info = model.transcribe(
+        path,
+        language=lang,
+        beam_size=5,
+        vad_filter=True,
+    )
+    parts: list[str] = []
+    for seg in segments:
+        t = seg.text.strip()
+        if t:
+            parts.append(t)
+    return " ".join(parts).strip()
 
 
 @asynccontextmanager
@@ -61,6 +112,8 @@ async def lifespan(app: FastAPI):
     yield
     _embed_model = None
     _chroma_collection = None
+    global _whisper_model
+    _whisper_model = None
 
 
 app = FastAPI(title="Meeting RAG", lifespan=lifespan)
@@ -83,6 +136,10 @@ class ChatRequest(BaseModel):
 class ChatResponse(BaseModel):
     response: str = Field("", description="Bullet-point answer; empty when live mode off")
     chunks_used: int = Field(0, description="Number of context chunks retrieved")
+
+
+class TranscribeResponse(BaseModel):
+    text: str = Field("", description="Whisper transcript")
 
 
 def retrieve_top_k(query: str, k: int = 3) -> tuple[list[str], int]:
@@ -160,6 +217,41 @@ def chat(req: ChatRequest) -> ChatResponse:
         )
 
     return ChatResponse(response=llm_text, chunks_used=n)
+
+
+@app.post("/transcribe", response_model=TranscribeResponse)
+async def transcribe(file: UploadFile = File(...)) -> TranscribeResponse:
+    """
+    Local Whisper transcription (faster-whisper). Upload recorded audio (e.g. webm from the browser).
+    Requires FFmpeg on PATH. First call downloads/loads the model (see WHISPER_MODEL).
+    """
+    raw = await file.read()
+    if len(raw) < 256:
+        raise HTTPException(status_code=400, detail="Audio too short or empty.")
+
+    suffix = Path(file.filename or "audio").suffix.lower()
+    if suffix not in {".webm", ".wav", ".mp3", ".m4a", ".ogg", ".flac", ".mp4", ".mpeg", ".mpga", ".oga"}:
+        suffix = ".webm"
+
+    tmp_path: str | None = None
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            tmp.write(raw)
+            tmp_path = tmp.name
+        text = await asyncio.to_thread(transcribe_audio_path, tmp_path)
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Transcription failed: {e!s}. Is FFmpeg installed and on PATH?",
+        ) from e
+    finally:
+        if tmp_path:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+    return TranscribeResponse(text=text)
 
 
 # Single-page UI without shadowing /docs or /openapi.json

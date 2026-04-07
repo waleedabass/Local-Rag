@@ -61,6 +61,35 @@
       cursor: pointer;
     }
     button#sendBtn:disabled { opacity: 0.45; cursor: not-allowed; }
+    button#recordBtn {
+      padding: 0.5rem 1rem;
+      border-radius: 8px;
+      border: 1px solid var(--border);
+      background: var(--panel);
+      color: var(--text);
+      cursor: pointer;
+      font-size: 0.95rem;
+      transition: background 0.15s, border-color 0.15s;
+    }
+    button#recordBtn:hover:not(:disabled) { filter: brightness(1.08); }
+    button#recordBtn:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
+    button#recordBtn.recording {
+      background: #4a2d2d;
+      border-color: #c75c5c;
+      color: #ffc9c9;
+      box-shadow: 0 0 0 1px rgba(199, 92, 92, 0.35);
+    }
+    .voice-status {
+      font-size: 0.85rem;
+      color: var(--muted);
+      flex: 1;
+      min-width: 12rem;
+    }
+    .voice-status.error { color: #e88a8a; }
+    .voice-status.working { color: #7dd3a0; }
     textarea#query {
       width: 100%;
       min-height: 140px;
@@ -108,7 +137,12 @@
     </div>
 
     <label for="query" class="toggle-label">Transcription / question</label>
-    <textarea id="query" placeholder="Paste live transcription or ask a question about your PDFs…"></textarea>
+    <textarea id="query" placeholder="Type, paste, or record with Whisper (local)…"></textarea>
+
+    <div class="row" id="voiceRow">
+      <button type="button" id="recordBtn" aria-pressed="false">Record (Whisper)</button>
+      <span class="voice-status" id="voiceStatus">Record audio → server runs local Whisper → text appears above.</span>
+    </div>
 
     <div class="row">
       <button type="button" id="sendBtn">Ask</button>
@@ -124,8 +158,161 @@
     const queryEl = document.getElementById("query");
     const sendBtn = document.getElementById("sendBtn");
     const outEl = document.getElementById("out");
+    const recordBtn = document.getElementById("recordBtn");
+    const voiceStatusEl = document.getElementById("voiceStatus");
 
     let isActive = false;
+    let mediaRecorder = null;
+    let mediaStream = null;
+    let recordedChunks = [];
+    let recordMime = "";
+    let isRecording = false;
+    let busy = false;
+
+    const canRecord =
+      typeof navigator !== "undefined" &&
+      navigator.mediaDevices &&
+      typeof MediaRecorder !== "undefined";
+
+    function appendTranscript(text) {
+      const t = (text || "").trim();
+      if (!t) return;
+      const cur = queryEl.value;
+      const sep = cur.length && !/\s$/.test(cur) ? " " : "";
+      queryEl.value = cur + sep + t;
+    }
+
+    /**
+     * @param {"idle"|"recording"|"busy"} state
+     * @param {string} [idleMessage] — when state is idle, shown under the button (default blurb if omitted)
+     * @param {boolean} [idleError]
+     */
+    function setRecordUi(state, idleMessage, idleError) {
+      isRecording = state === "recording";
+      busy = state === "busy";
+      if (!canRecord) {
+        recordBtn.disabled = true;
+        recordBtn.textContent = "Record unavailable";
+        voiceStatusEl.textContent = "This browser does not support MediaRecorder.";
+        voiceStatusEl.className = "voice-status error";
+        return;
+      }
+      if (busy) {
+        recordBtn.disabled = true;
+        recordBtn.classList.remove("recording");
+        recordBtn.textContent = "Transcribing…";
+        recordBtn.setAttribute("aria-pressed", "false");
+        voiceStatusEl.textContent = "Running local Whisper on the server…";
+        voiceStatusEl.className = "voice-status working";
+        return;
+      }
+      recordBtn.disabled = false;
+      recordBtn.classList.toggle("recording", isRecording);
+      recordBtn.setAttribute("aria-pressed", String(isRecording));
+      recordBtn.textContent = isRecording ? "Stop & transcribe" : "Record (Whisper)";
+      if (isRecording) {
+        voiceStatusEl.textContent = "Recording… click again when finished.";
+        voiceStatusEl.className = "voice-status working";
+        return;
+      }
+      /* idle */
+      isRecording = false;
+      busy = false;
+      if (idleMessage !== undefined) {
+        voiceStatusEl.textContent = idleMessage;
+        voiceStatusEl.className = "voice-status" + (idleError ? " error" : "");
+      } else {
+        voiceStatusEl.textContent =
+          "Audio is processed on your machine (Whisper), not by browser speech APIs.";
+        voiceStatusEl.className = "voice-status";
+      }
+    }
+
+    async function uploadRecording(blob) {
+      setRecordUi("busy");
+      const fd = new FormData();
+      fd.append("file", blob, "capture.webm");
+      try {
+        const r = await fetch("/transcribe", { method: "POST", body: fd });
+        const raw = await r.text();
+        if (!r.ok) {
+          let detail = raw;
+          try {
+            const j = JSON.parse(raw);
+            detail = j.detail != null ? (typeof j.detail === "string" ? j.detail : JSON.stringify(j.detail)) : raw;
+          } catch (_) {}
+          setRecordUi("idle", detail || "Transcription failed.", true);
+          return;
+        }
+        const data = JSON.parse(raw);
+        appendTranscript(data.text || "");
+        setRecordUi(
+          "idle",
+          "Done. Edit the text above if needed, then Ask.",
+          false,
+        );
+      } catch (e) {
+        setRecordUi("idle", String(e), true);
+      }
+    }
+
+    recordBtn.addEventListener("click", async () => {
+      if (!canRecord || busy) return;
+
+      if (isRecording && mediaRecorder && mediaRecorder.state === "recording") {
+        mediaRecorder.stop();
+        return;
+      }
+
+      try {
+        mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      } catch (e) {
+        voiceStatusEl.textContent = "Microphone blocked or unavailable: " + String(e);
+        voiceStatusEl.className = "voice-status error";
+        return;
+      }
+
+      recordMime = MediaRecorder.isTypeSupported("audio/webm;codecs=opus")
+        ? "audio/webm;codecs=opus"
+        : MediaRecorder.isTypeSupported("audio/webm")
+          ? "audio/webm"
+          : "";
+
+      if (!recordMime) {
+        mediaStream.getTracks().forEach((t) => t.stop());
+        mediaStream = null;
+        voiceStatusEl.textContent = "No supported WebM audio MIME type.";
+        voiceStatusEl.className = "voice-status error";
+        return;
+      }
+
+      recordedChunks = [];
+      mediaRecorder = new MediaRecorder(mediaStream, { mimeType: recordMime });
+
+      mediaRecorder.ondataavailable = (ev) => {
+        if (ev.data && ev.data.size > 0) recordedChunks.push(ev.data);
+      };
+
+      mediaRecorder.onstop = () => {
+        if (mediaStream) {
+          mediaStream.getTracks().forEach((t) => t.stop());
+          mediaStream = null;
+        }
+        const blob = new Blob(recordedChunks, { type: recordMime });
+        recordedChunks = [];
+        mediaRecorder = null;
+        if (blob.size < 256) {
+          setRecordUi("idle", "Clip too short — try recording a bit longer.", true);
+          return;
+        }
+        uploadRecording(blob);
+      };
+
+      mediaRecorder.start(250);
+      setRecordUi("recording");
+    });
+
+    setRecordUi("idle", "Record audio → server runs local Whisper → text appears above.");
 
     function syncUi() {
       liveToggle.textContent = isActive ? "Live Mode: ON" : "Live Mode: OFF";
