@@ -24,6 +24,8 @@ EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 
 CHUNK_SIZE = 1000
 CHUNK_OVERLAP = 200
+# Chroma rejects add() when len(ids) exceeds its max batch size (often ~5k).
+CHROMA_ADD_BATCH = 4000
 
 
 def load_pdf_texts(source: Path) -> list[tuple[str, str]]:
@@ -117,7 +119,16 @@ def main() -> None:
         name=COLLECTION_NAME,
         metadata={"hnsw:space": "cosine"},
     )
-    collection.add(ids=all_ids, documents=all_chunks, metadatas=all_metas, embeddings=embeddings)
+    n = len(all_ids)
+    for start in range(0, n, CHROMA_ADD_BATCH):
+        end = min(start + CHROMA_ADD_BATCH, n)
+        collection.add(
+            ids=all_ids[start:end],
+            documents=all_chunks[start:end],
+            metadatas=all_metas[start:end],
+            embeddings=embeddings[start:end],
+        )
+        print(f"  Wrote chunks {start + 1}-{end} of {n}...")
     print(f"Stored {len(all_ids)} vectors in {DB_DIR} (collection '{COLLECTION_NAME}').")
 
 
