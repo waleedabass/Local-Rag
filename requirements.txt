@@ -1,0 +1,10 @@
+# Local PDF RAG + FastAPI + Ollama
+# For NVIDIA GPU: install PyTorch with CUDA from https://pytorch.org/get-started/locally/
+chromadb>=0.4.22
+sentence-transformers>=2.2.0
+pymupdf>=1.23.0
+fastapi>=0.109.0
+uvicorn[standard]>=0.27.0
+httpx>=0.26.0
+langchain-text-splitters>=0.2.0
+torch>=2.0.0

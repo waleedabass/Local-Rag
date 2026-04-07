@@ -1,0 +1,172 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Meeting RAG — Live Mode</title>
+  <style>
+    :root {
+      --bg: #0f1419;
+      --panel: #1a2332;
+      --text: #e7ecf3;
+      --muted: #8b9cb3;
+      --accent: #3d9eff;
+      --accent-dim: #2a6fad;
+      --border: #2d3a4d;
+    }
+    * { box-sizing: border-box; }
+    body {
+      font-family: "Segoe UI", system-ui, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      margin: 0;
+      min-height: 100vh;
+      padding: 1.5rem;
+      line-height: 1.5;
+    }
+    .wrap { max-width: 720px; margin: 0 auto; }
+    h1 { font-size: 1.25rem; font-weight: 600; margin: 0 0 0.5rem; }
+    p.sub { color: var(--muted); font-size: 0.9rem; margin: 0 0 1.25rem; }
+    .row {
+      display: flex;
+      align-items: center;
+      gap: 0.75rem;
+      margin-bottom: 1rem;
+      flex-wrap: wrap;
+    }
+    label.toggle-label { font-size: 0.95rem; user-select: none; }
+    button#liveToggle {
+      padding: 0.5rem 1rem;
+      border-radius: 8px;
+      border: 1px solid var(--border);
+      background: var(--panel);
+      color: var(--text);
+      cursor: pointer;
+      font-size: 0.95rem;
+      transition: background 0.15s, border-color 0.15s;
+    }
+    button#liveToggle.on {
+      background: var(--accent-dim);
+      border-color: var(--accent);
+      color: #fff;
+    }
+    button#liveToggle:hover { filter: brightness(1.08); }
+    button#sendBtn {
+      padding: 0.5rem 1.25rem;
+      border-radius: 8px;
+      border: none;
+      background: var(--accent);
+      color: #0a0e14;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    button#sendBtn:disabled { opacity: 0.45; cursor: not-allowed; }
+    textarea#query {
+      width: 100%;
+      min-height: 140px;
+      padding: 0.75rem 1rem;
+      border-radius: 8px;
+      border: 1px solid var(--border);
+      background: var(--panel);
+      color: var(--text);
+      font-size: 0.95rem;
+      resize: vertical;
+      margin-bottom: 0.75rem;
+    }
+    textarea#query:focus {
+      outline: 2px solid var(--accent);
+      outline-offset: 1px;
+    }
+    .status {
+      font-size: 0.85rem;
+      color: var(--muted);
+      margin-bottom: 0.75rem;
+    }
+    .status.live-on { color: #6ecf8e; }
+    .status.live-off { color: #c9a227; }
+    pre#out {
+      white-space: pre-wrap;
+      word-break: break-word;
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 1rem;
+      margin: 0;
+      font-size: 0.9rem;
+      min-height: 4rem;
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>Meeting assistant (local RAG)</h1>
+    <p class="sub">Toggle Live Mode on only when you need answers—requests are skipped when off to save GPU.</p>
+
+    <div class="row">
+      <button type="button" id="liveToggle" aria-pressed="false">Live Mode: OFF</button>
+      <span class="status live-off" id="status">GPU-heavy path disabled.</span>
+    </div>
+
+    <label for="query" class="toggle-label">Transcription / question</label>
+    <textarea id="query" placeholder="Paste live transcription or ask a question about your PDFs…"></textarea>
+
+    <div class="row">
+      <button type="button" id="sendBtn">Ask</button>
+    </div>
+
+    <p class="toggle-label" style="margin-bottom:0.35rem">Response</p>
+    <pre id="out"></pre>
+  </div>
+
+  <script>
+    const liveToggle = document.getElementById("liveToggle");
+    const statusEl = document.getElementById("status");
+    const queryEl = document.getElementById("query");
+    const sendBtn = document.getElementById("sendBtn");
+    const outEl = document.getElementById("out");
+
+    let isActive = false;
+
+    function syncUi() {
+      liveToggle.textContent = isActive ? "Live Mode: ON" : "Live Mode: OFF";
+      liveToggle.classList.toggle("on", isActive);
+      liveToggle.setAttribute("aria-pressed", String(isActive));
+      statusEl.className = "status " + (isActive ? "live-on" : "live-off");
+      statusEl.textContent = isActive
+        ? "Retrieval + LLM enabled for each request."
+        : "GPU-heavy path disabled; answers will be empty.";
+    }
+
+    liveToggle.addEventListener("click", () => {
+      isActive = !isActive;
+      syncUi();
+    });
+    syncUi();
+
+    async function sendChat() {
+      const query = queryEl.value;
+      outEl.textContent = isActive ? "…" : "";
+      sendBtn.disabled = true;
+      try {
+        const r = await fetch("/chat", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ query, is_active: isActive }),
+        });
+        if (!r.ok) {
+          outEl.textContent = "HTTP " + r.status + ": " + (await r.text());
+          return;
+        }
+        const data = await r.json();
+        outEl.textContent = data.response || "";
+      } catch (e) {
+        outEl.textContent = String(e);
+      } finally {
+        sendBtn.disabled = false;
+      }
+    }
+
+    sendBtn.addEventListener("click", sendChat);
+  </script>
+</body>
+</html>
